@@ -1,13 +1,17 @@
 name: Build and Push OpenClaw Image
 
+# ---------------------------------------------------------------
+# WHEN does this run?
+#   1. Every day at 06:00 UTC (checks for new OpenClaw releases)
+#   2. Whenever you manually click "Run workflow" in the Actions tab
+# ---------------------------------------------------------------
 on:
   schedule:
-    # Runs daily at 06:00 UTC -- checks for new OpenClaw releases
     - cron: "0 6 * * *"
   workflow_dispatch:
     inputs:
       force_version:
-        description: "Force build a specific version tag (e.g., v2026.2.9). Leave empty to auto-detect latest."
+        description: "Force a specific version (e.g. v2026.2.9). Leave empty to auto-detect latest."
         required: false
         default: ""
 
@@ -23,47 +27,55 @@ jobs:
   check-and-build:
     runs-on: ubuntu-latest
     steps:
+
+      # ── Step 1: Figure out which version to build ──
       - name: Determine target version
         id: version
         run: |
           if [ -n "${{ github.event.inputs.force_version }}" ]; then
             TAG="${{ github.event.inputs.force_version }}"
           else
-            TAG=$(curl -sf "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest" \
-              | jq -r '.tag_name')
+            RELEASE_JSON=$(curl -sf "https://api.github.com/repos/${{ env.UPSTREAM_REPO }}/releases/latest")
+            TAG=$(echo "$RELEASE_JSON" | jq -r '.tag_name')
           fi
+
           if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
             echo "::error::Could not determine upstream version"
             exit 1
           fi
-          # Normalise: strip leading 'v' for the bare version, keep 'v' prefix for git tag
+
           BARE="${TAG#v}"
           echo "tag=v${BARE}" >> "$GITHUB_OUTPUT"
           echo "bare=${BARE}" >> "$GITHUB_OUTPUT"
-          echo "Resolved upstream version: v${BARE}"
+          echo "### Target version: v${BARE}" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Check if we already built this version
+      # ── Step 2: Skip if we already built this exact version ──
+      - name: Check if already built
         id: check
         run: |
           STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
             "https://api.github.com/repos/${{ github.repository }}/releases/tags/${{ steps.version.outputs.tag }}")
           if [ "$STATUS" = "200" ] && [ -z "${{ github.event.inputs.force_version }}" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
-            echo "Version ${{ steps.version.outputs.tag }} already built. Skipping."
+            echo "### Skipped -- v${{ steps.version.outputs.bare }} already built" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Clone upstream at release tag
+      # ── Step 3: Clone the official OpenClaw repo at that version ──
+      - name: Clone upstream source
         if: steps.check.outputs.skip == 'false'
         run: |
           git clone --depth 1 --branch "${{ steps.version.outputs.tag }}" \
             "https://github.com/${{ env.UPSTREAM_REPO }}.git" openclaw-src
+          echo "Cloned openclaw/openclaw at ${{ steps.version.outputs.tag }}"
 
+      # ── Step 4: Set up Docker build tools ──
       - name: Set up Docker Buildx
         if: steps.check.outputs.skip == 'false'
         uses: docker/setup-buildx-action@v3
 
+      # ── Step 5: Log in to GitHub Container Registry ──
       - name: Log in to ghcr.io
         if: steps.check.outputs.skip == 'false'
         uses: docker/login-action@v3
@@ -72,7 +84,8 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push
+      # ── Step 6: Build the Docker image and push it ──
+      - name: Build and push image
         if: steps.check.outputs.skip == 'false'
         uses: docker/build-push-action@v6
         with:
@@ -86,6 +99,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ── Step 7: Create a GitHub Release so CloudClaw can check versions ──
       - name: Create GitHub Release
         if: steps.check.outputs.skip == 'false'
         uses: softprops/action-gh-release@v2
@@ -95,4 +109,17 @@ jobs:
           body: |
             Auto-built from [openclaw/openclaw@${{ steps.version.outputs.tag }}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.version.outputs.tag }}).
 
-            
+            **Pull command:**
+            ```
+            docker pull ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.bare }}
+            ```
+          generate_release_notes: false
+
+      # ── Step 8: Print a summary ──
+      - name: Summary
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          echo "### Build complete" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Image: \`${{ env.IMAGE_NAME }}:${{ steps.version.outputs.bare }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Also tagged as: \`:latest\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Release: \`${{ steps.version.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"

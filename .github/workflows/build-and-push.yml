@@ -85,6 +85,16 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       # ── Step 6: Build the Docker image and push it ──
+      #
+      # Build args (verified against openclaw/Dockerfile ARG declarations):
+      #   OPENCLAW_INSTALL_BROWSER=1   → installs Chromium + Xvfb (~300 MB)
+      #     Enables the "browser" tool for web research, scraping, screenshots.
+      #     Pre-installs Playwright browsers at build time (avoids 60-90s
+      #     first-run delay).
+      #   OPENCLAW_INSTALL_DOCKER_CLI=1 → installs docker-ce-cli (~50 MB)
+      #     Enables sandbox mode (agents.defaults.sandbox) for isolating
+      #     sub-agent sessions in Docker containers.  Requires the host
+      #     Docker socket to be mounted into the container at runtime.
       - name: Build and push image
         if: steps.check.outputs.skip == 'false'
         uses: docker/build-push-action@v6
@@ -92,6 +102,9 @@ jobs:
           context: ./openclaw-src
           file: ./openclaw-src/Dockerfile
           push: true
+          build-args: |
+            OPENCLAW_INSTALL_BROWSER=1
+            OPENCLAW_INSTALL_DOCKER_CLI=1
           tags: |
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.bare }}
             ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.tag }}
@@ -109,6 +122,8 @@ jobs:
           body: |
             Auto-built from [openclaw/openclaw@${{ steps.version.outputs.tag }}](https://github.com/${{ env.UPSTREAM_REPO }}/releases/tag/${{ steps.version.outputs.tag }}).
 
+            **Includes:** Chromium (browser tool) + Docker CLI (sandbox mode).
+
             **Pull command:**
             ```
             docker pull ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.bare }}
@@ -123,3 +138,4 @@ jobs:
           echo "- Image: \`${{ env.IMAGE_NAME }}:${{ steps.version.outputs.bare }}\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Also tagged as: \`:latest\`" >> "$GITHUB_STEP_SUMMARY"
           echo "- Release: \`${{ steps.version.outputs.tag }}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Build args: OPENCLAW_INSTALL_BROWSER=1, OPENCLAW_INSTALL_DOCKER_CLI=1" >> "$GITHUB_STEP_SUMMARY"

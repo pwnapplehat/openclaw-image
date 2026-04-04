@@ -1,0 +1,154 @@
+name: Rebuild CloudClaw Tenant OS
+
+# =============================================================================
+# WHEN does this run?
+#   1. After openclaw-image workflow completes successfully (automatic)
+#   2. Manually via "Run workflow" button in Actions tab
+#   3. Daily at 07:00 UTC (checks for new OpenClaw versions)
+# =============================================================================
+on:
+  workflow_run:
+    workflows: ["Build and Push OpenClaw Image"]
+    types:
+      - completed
+  schedule:
+    - cron: "0 7 * * *"  # Daily at 07:00 UTC
+  workflow_dispatch:
+    inputs:
+      openclaw_version:
+        description: "OpenClaw version to use (e.g., 2026.3.31, or 'latest')"
+        required: false
+        default: "latest"
+
+jobs:
+  rebuild-tenant-os:
+    runs-on: ubuntu-latest
+    # Only run if the upstream workflow succeeded (or if manually triggered)
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.PRODUCTION_SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.PRODUCTION_SERVER_IP }} >> ~/.ssh/known_hosts
+
+      - name: Determine OpenClaw version
+        id: version
+        run: |
+          if [ "${{ github.event.inputs.openclaw_version }}" != "" ]; then
+            VERSION="${{ github.event.inputs.openclaw_version }}"
+          else
+            # Get latest version from GitHub releases
+            RELEASE_JSON=$(curl -sf "https://api.github.com/repos/pwnapplehat/openclaw-image/releases/latest")
+            VERSION=$(echo "$RELEASE_JSON" | jq -r '.tag_name // "latest"')
+            if [ "$VERSION" = "null" ]; then
+              VERSION="latest"
+            fi
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "### Target OpenClaw version: $VERSION" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Check if rebuild is needed
+        id: check
+        run: |
+          # Get the currently embedded OpenClaw version from the server
+          CURRENT_VERSION=$(ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            root@${{ secrets.PRODUCTION_SERVER_IP }} \
+            "docker run --rm cloudclaw-tenant-os:latest tar -xOf /opt/openclaw-image.tar manifest.json 2>/dev/null | jq -r '.[0].RepoTags[0]' 2>/dev/null || echo 'none'")
+          
+          TARGET_IMAGE="ghcr.io/pwnapplehat/openclaw-image:${{ steps.version.outputs.version }}"
+          
+          echo "Current embedded: $CURRENT_VERSION"
+          echo "Target image: $TARGET_IMAGE"
+          
+          if echo "$CURRENT_VERSION" | grep -q "${{ steps.version.outputs.version }}"; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "### ⏭️ Skipped - OpenClaw ${{ steps.version.outputs.version }} already embedded" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+            echo "### 🔄 Rebuilding with OpenClaw ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload CloudClaw source to server
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          # Create tarball of CloudClaw source (exclude node_modules, .git, etc.)
+          tar --exclude='.git' \
+              --exclude='node_modules' \
+              --exclude='.next' \
+              --exclude='openclaw-image.tar' \
+              -czf cloudclaw-src.tar.gz \
+              Dockerfile.tenant \
+              packer/ \
+              master-node/
+          
+          # Upload to server
+          scp -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            cloudclaw-src.tar.gz \
+            root@${{ secrets.PRODUCTION_SERVER_IP }}:/tmp/
+          
+          # Extract on server
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            root@${{ secrets.PRODUCTION_SERVER_IP }} \
+            "cd /root/cloudclaw && tar -xzf /tmp/cloudclaw-src.tar.gz && rm /tmp/cloudclaw-src.tar.gz"
+
+      - name: Rebuild tenant OS image on server
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            root@${{ secrets.PRODUCTION_SERVER_IP }} << 'EOF'
+          set -e
+          cd /root/cloudclaw/master-node
+          
+          # Set version if not latest
+          if [ "${{ steps.version.outputs.version }}" != "latest" ]; then
+            export OPENCLAW_IMAGE="ghcr.io/pwnapplehat/openclaw-image:${{ steps.version.outputs.version }}"
+          fi
+          
+          # Run the build script
+          bash build-tenant-os.sh
+          
+          # Verify the new image exists
+          docker images cloudclaw-tenant-os:latest
+          EOF
+
+      - name: Restart Node Agent (to pick up new image)
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          ssh -i ~/.ssh/id_ed25519 -o StrictHostKeyChecking=no \
+            root@${{ secrets.PRODUCTION_SERVER_IP }} << 'EOF'
+          set -e
+          
+          # Restart Node Agent container
+          docker restart node-agent
+          
+          # Wait for it to be healthy
+          sleep 5
+          docker logs node-agent --tail 5
+          EOF
+
+      - name: Summary
+        if: steps.check.outputs.skip == 'false'
+        run: |
+          echo "### ✅ Tenant OS rebuilt successfully" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**OpenClaw version:** ${{ steps.version.outputs.version }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Server:** ${{ secrets.PRODUCTION_SERVER_IP }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "New deployments will now use the updated OpenClaw image." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "### ❌ Tenant OS rebuild failed" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Please check the logs and rebuild manually if needed:" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`bash" >> "$GITHUB_STEP_SUMMARY"
+          echo "ssh root@${{ secrets.PRODUCTION_SERVER_IP }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "cd /root/cloudclaw/master-node && bash build-tenant-os.sh" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`\`\`" >> "$GITHUB_STEP_SUMMARY"
